@@ -1,8 +1,6 @@
 ''' 
     3rd step: insert muse into background using control net image to image (synthetic image for now)
 
-
-
 '''
 
 from diffusers import StableDiffusionPipeline, ControlNetModel, StableDiffusionControlNetImg2ImgPipeline, StableDiffusionControlNetPipeline
@@ -18,7 +16,7 @@ pipe = StableDiffusionControlNetPipeline.from_pretrained(
     "runwayml/stable-diffusion-v1-5",
     controlnet=controlnet,
     torch_dtype=torch.float16
-)
+).to("cuda")
 
 pose_image_path = "muse-images/terpiscore_pose.png"
 background_image_path = "predictions-forest-prompt/forest_1.png"
