@@ -1,7 +1,7 @@
 export MODEL_NAME="stable-diffusion-v1-5/stable-diffusion-v1-5"
 export INSTANCE_DIR="./muse"
 export CLASS_DIR="./class-images"
-export OUTPUT_DIR="path_to_saved_model"
+export OUTPUT_DIR="calliope-model"
 
 accelerate launch train_dreambooth.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
@@ -17,5 +17,6 @@ accelerate launch train_dreambooth.py \
   --lr_warmup_steps=0 \
   --max_train_steps=400 \
   --with_prior_preservation \
+  --mixed_precision=fp16 \
   --class_prompt="a photo of a muse" \
   --push_to_hub
