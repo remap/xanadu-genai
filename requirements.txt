@@ -1,0 +1,6 @@
+huggingface_hub
+diffusers
+transformers
+mediapipe
+controlnet_aux
+replicate
