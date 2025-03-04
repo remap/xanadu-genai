@@ -1,0 +1,16 @@
+{
+    "media_file": "[{'name': 'thalia-3597-567-xDP89tlOqz30-media.png', 'mimetype': 'image/png'}, {'name': 'thalia-3597-567-xDP89tlOqz30-media.exr', 'mimetype': 'image/x-exr'}]",
+    "metadata_file": "thalia-3597-567-xDP89tlOqz30-metadata.json",
+    "params_url": "https://docs.google.com/spreadsheets/d/1EIe9OFpqO1Wc0sYjNSKXhSRBO7k17v9wZE34b3F3TJ4/edit?usp=sharing",
+    "input_bucket": "dev-xanadu-raw-input",
+    "output_bucket": "dev-xanadu-postprocess",
+    "instance": "jb_testing",
+    "target_environment": "dev",
+    "module": "ch1",
+    "trial": "567",
+    "user": "3597",
+    "group": "thalia",
+    "tags": "['tag1', 'tag2']",
+    "mimetype": "",
+    "timestamp": "2025-03-01T17:55:47"
+}
