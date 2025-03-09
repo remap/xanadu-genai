@@ -16,6 +16,17 @@ import numpy as np
 from PIL import Image
 import cv2
 
+from deepseek_vl.models import MultiModalityCausalLM, VLChatProcessor
+from deepseek_vl.utils.io import load_pil_images
+
+from diffusers import StableDiffusionControlNetInpaintPipeline, ControlNetModel
+from diffusers.utils import load_image
+from diffusers import AutoPipelineForInpainting
+
+
+
+
+
 # Configure logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -49,35 +60,45 @@ def decode_base64_image(image_b64: str) -> Image.Image:
     return Image.open(io.BytesIO(image_data)).convert("RGB")
 
 # --- DeepSeek Prompt Generation ---
-def generate_prompt(prompt: str, image: Image.Image, vl_chat_processor, tokenizer, vl_gpt) -> str:
-    """
-    Generate a text prompt using the DeepSeek VL model.
-    """
+def generate_prompt(images, vl_chat_processor, tokenizer, vl_gpt, prompt=None, json_format=False) -> str:
+
+    ## This prompt can be played around with
+    if prompt is None:
+        prompt = "Give me a caption for this background scene. Please describe as many aspects of the scene as you can, with specific descriptions of what is happening in each portion of the image. Please also describe the relative locations of objects and imagery in the scene in relation to each other. "
+    
     conversation = [
         {
             "role": "User",
+            # Note: Prepend the placeholder if your model expects it.
             "content": f"<image_placeholder> {prompt}",
-            "images": [image]
+            "images": images
         },
         {"role": "Assistant", "content": ""},
     ]
-    # Load images (this function comes from deepseek_vl)
-    from deepseek_vl.utils.io import load_pil_images
-    pil_images = load_pil_images(conversation)
-    
-    # Set DeepSeek device (adjust if needed)
-    torch.cuda.set_device("cuda:3")
+
+    # Load the image(s) for this conversation.
+    if isinstance(images[0], Image.Image):
+        pil_images = images
+    else:
+        pil_images = load_pil_images(conversation)
+
+    # torch.cuda.set_device(vl_gpt.device)
+
+    # Prepare inputs using the VLChat processor.
     prepare_inputs = vl_chat_processor(
         conversations=conversation, images=pil_images, force_batchify=True
-    ).to("cuda")
-    
-    # Ensure all tensors are moved to GPU
+    ).to(vl_gpt.device)
+
+    # If prepare_inputs does not have a .to() method for all tensors,
+    # iterate over its attributes and move any tensor to GPU.
     for key, value in vars(prepare_inputs).items():
         if isinstance(value, torch.Tensor):
             setattr(prepare_inputs, key, value.cuda())
-    
-    # Prepare image embeddings and generate response
+
+    # Run the image encoder to get image embeddings.
     inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
+
+    # Generate a response.
     outputs = vl_gpt.language_model.generate(
         inputs_embeds=inputs_embeds,
         attention_mask=prepare_inputs.attention_mask,
@@ -88,7 +109,26 @@ def generate_prompt(prompt: str, image: Image.Image, vl_chat_processor, tokenize
         do_sample=False,
         use_cache=True,
     )
+
+    # Decode the output.
     answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
+    sft_format = getattr(prepare_inputs, "sft_format", [""])[0]  # Adjust if needed.
+
+    # Save the result.
+    # result = {
+    #     "prompt": prompt,
+    #     "image": image,
+    #     "response": answer,
+    # }
+
+    result = answer
+
+    if json_format:
+        try:
+            result = json.loads(answer)
+        except Exception as e:
+            raise ValueError(f"Failed to parse answer as JSON. Answer: {answer}\nError: {e}")
+    
     return answer
 
 # --- Inpainting Helpers ---
@@ -326,6 +366,7 @@ def predict_fn(input_data, model):
     face_mask = detections[1].mask
     garment_mask_image = Image.fromarray(garment_mask).convert("L")
     face_mask_image = Image.fromarray(face_mask).convert("L")
+    logger.info("Segmentation completed.")
     
     # Prepare control image tensor for inpainting
     control_image_tensor = make_inpaint_condition(person_image, garment_mask_image)
