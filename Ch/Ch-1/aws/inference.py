@@ -324,7 +324,7 @@ def predict_fn(input_data, model):
     # Generate prompt
     background_description_prompt = params_dict["ch1-default-background_description_prompt"]
     logger.info("Generating background description")
-    image_prompt = generate_prompt([bg_image], vl_chat_processor, tokenizer, vl_gpt, prompt=background_description_prompt, max_sequence_length=2048)
+    image_prompt = generate_prompt([bg_image], vl_chat_processor, tokenizer, vl_gpt, prompt=background_description_prompt)
     logger.info(f"Prompt generated: {image_prompt}")
 
     # Generate image

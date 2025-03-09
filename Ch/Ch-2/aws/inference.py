@@ -346,15 +346,17 @@ def predict_fn(input_data, model):
         raise ValueError("Both 'sketch' and 'person' images must be provided in base64 format.")
     sketch_image = decode_base64_image(sketch_b64)
     person_image = decode_base64_image(person_b64)
+
+    #image_prompt = generate_prompt([bg_image], vl_chat_processor, tokenizer, vl_gpt, prompt=background_description_prompt, max_sequence_length=2048)
     
     # Generate garment classification using DeepSeek
-    garment_type = generate_prompt(classification_prompt, sketch_image, 
-                                   model["vl_chat_processor"], model["tokenizer"], model["vl_gpt"]).strip()
+    garment_type = generate_prompt([sketch_image], 
+                                   model["vl_chat_processor"], model["tokenizer"], model["vl_gpt"], classification_prompt).strip()
     logger.info(f"Garment classification: {garment_type}")
     
     # Generate a detailed description
-    description = generate_prompt(description_prompt, sketch_image, 
-                                  model["vl_chat_processor"], model["tokenizer"], model["vl_gpt"]).strip()
+    description = generate_prompt([sketch_image], 
+                                  model["vl_chat_processor"], model["tokenizer"], model["vl_gpt"], description_prompt).strip()
     logger.info(f"Generated description: {description}")
     
     # Perform segmentation on the person image to obtain garment and face masks
