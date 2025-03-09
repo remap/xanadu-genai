@@ -389,6 +389,7 @@ def predict_fn(input_data, model):
             generator=generator,
         )
         inpainted_image = output.images[0]
+        logger.info("SD1.5 Inpainting completed.")
     else:
         sdxl_pipe = model["sdxl_pipe"]
         output = sdxl_pipe(
@@ -401,13 +402,14 @@ def predict_fn(input_data, model):
             generator=generator,
         )
         inpainted_image = output.images[0]
+        logger.info("SDXL Inpainting completed.")
     
     # Resize inpainted image to match the original person image dimensions
     inpainted_resized = inpainted_image.resize(person_image.size, resample=Image.LANCZOS)
-    
+    logger.info("Inpainted image resized.")
     # Apply face correction by compositing the original face from the person image
     final_image = composite_face(person_image, inpainted_resized, face_mask_image)
-    
+    logger.info("Face correction applied.")
     return final_image
 
 def output_fn(prediction, accept):
