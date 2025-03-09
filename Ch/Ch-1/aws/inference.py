@@ -2,6 +2,8 @@ import importlib
 import sys
 import os
 import logging
+import requests # this should be imported into all modules
+import pandas as pd
 
 # Configure logging
 logger = logging.getLogger()
@@ -50,6 +52,46 @@ class SD3CannyImageProcessor(VaeImageProcessor):
         do_denormalize = [True] * image.shape[0]
         image = super().postprocess(image, **kwargs, do_denormalize=do_denormalize)
         return image
+
+def parse_sheet_url(url):
+    """
+    Extracts the spreadsheet id and gid from a Google Sheets URL.
+    
+    Parameters:
+        url (str): The full URL of the Google Sheet.
+        
+    Returns:
+        tuple: (sheet_id, gid) or (None, None) if not found.
+    """
+    import re
+    # Match the spreadsheet id which is between /d/ and the next slash
+    sheet_id_match = re.search(r'/d/([^/]+)', url)
+    sheet_id = sheet_id_match.group(1) if sheet_id_match else None
+    
+    # Match the gid parameter in the URL (after 'gid=')
+    gid_match = re.search(r'gid=([0-9]+)', url)
+    gid = gid_match.group(1) if gid_match else None
+    
+    return sheet_id, gid
+
+def get_param_dict(spreadsheet_url):
+    sheet_id, gid = parse_sheet_url(spreadsheet_url)
+    json_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:json&gid={gid}"
+    response = requests.get(json_url)
+
+    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+    csv_content = requests.get(csv_url).content
+    # Decode and load the CSV into a pandas DataFrame
+    df = pd.read_csv(io.StringIO(csv_content.decode('utf-8')))
+
+    # Convert the DataFrame to a dictionary
+    data_dict = {}
+    for _, row in df.iterrows():
+        # Create a composite key using Module, Group, and Field
+        key = f"{row['Module']}-{row['Group']}-{row['Field']}"
+        data_dict[key] = row.to_dict()
+    
+    return data_dict
     
 def generate_prompt(images, vl_chat_processor, tokenizer, vl_gpt, prompt=None, json_format=False) -> str:
 
@@ -237,15 +279,24 @@ def predict_fn(input_data, model):
     # Parse input data
     bg_image_base64 = input_data["bg_image"]
     muse_image_base64 = input_data["muse_image"]
-    image_prompt = input_data.get("image_prompt", None)
-    extra_image_prompt = input_data.get("extra_image_prompt", " in a realistic 1980s retro vaporwave style")
-    llm_prompt = input_data.get("llm_prompt", None)
+    #image_prompt = input_data.get("image_prompt", None)
+    #extra_image_prompt = input_data.get("extra_image_prompt", " in a realistic 1980s retro vaporwave style")
+    #background_generationprompt = input_data.get("llm_prompt", None)
     negative_prompt = input_data.get("negative_prompt", "")
     steps = input_data.get("steps", 50)
     guidance_scale = input_data.get("guidance_scale", 7.5)
     controlnet_condition_scale = input_data.get("controlnet_condition_scale", 0.8)
     generator_seed = input_data.get("generator_seed", 0)
+    spreadsheet_url = input_data.get("params_url", "https://docs.google.com/spreadsheets/d/1EIe9OFpqO1Wc0sYjNSKXhSRBO7k17v9wZE34b3F3TJ4/edit?gid=866270832#gid=866270832")
     # max_sequence_length = input_data.get("max_sequence_length", 2048)
+
+    params_dict = get_param_dict(spreadsheet_url)
+    logger.info(f"Params dict: {params_dict}")
+
+    # Retrieving relevant prompts from param_dict
+    background_description_prompt = params_dict["ch1-default-background_description_prompt"]
+    vaporwave_prompt = params_dict["ch1-default-80s_prefix"]
+    negative_prompt = params_dict["ch1-default-80s_negative"]
 
     # Convert base64 to image
     if bg_image_base64 is not None:
@@ -271,9 +322,9 @@ def predict_fn(input_data, model):
     vl_gpt = model["vl_gpt"]
 
     # Generate prompt
-    if image_prompt is None:
-        logger.info("Generating prompt for background image")
-        image_prompt = generate_prompt([bg_image], vl_chat_processor, tokenizer, vl_gpt, prompt=llm_prompt)
+    background_description_prompt = params_dict["ch1-default-background_description_prompt"]
+    logger.info("Generating background description")
+    image_prompt = generate_prompt([bg_image], vl_chat_processor, tokenizer, vl_gpt, prompt=background_description_prompt, max_sequence_length=2048)
     logger.info(f"Prompt generated: {image_prompt}")
 
     # Generate image
@@ -281,7 +332,7 @@ def predict_fn(input_data, model):
     # Stable Diffusion inference
     generator = torch.Generator(device="cpu").manual_seed(generator_seed)
     generated_image = sd_pipe(
-        prompt=image_prompt+extra_image_prompt,
+        prompt=image_prompt+vaporwave_prompt,
         negative_prompt=negative_prompt,
         control_image=bg_image,
         controlnet_conditioning_scale=controlnet_condition_scale,
