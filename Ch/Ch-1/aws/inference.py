@@ -3,7 +3,6 @@ import sys
 import os
 import logging
 import requests # this should be imported into all modules
-import pandas as pd
 
 # Configure logging
 logger = logging.getLogger()
@@ -52,85 +51,38 @@ class SD3CannyImageProcessor(VaeImageProcessor):
         do_denormalize = [True] * image.shape[0]
         image = super().postprocess(image, **kwargs, do_denormalize=do_denormalize)
         return image
-
-def parse_sheet_url(url):
-    """
-    Extracts the spreadsheet id and gid from a Google Sheets URL.
     
-    Parameters:
-        url (str): The full URL of the Google Sheet.
-        
-    Returns:
-        tuple: (sheet_id, gid) or (None, None) if not found.
-    """
-    import re
-    # Match the spreadsheet id which is between /d/ and the next slash
-    sheet_id_match = re.search(r'/d/([^/]+)', url)
-    sheet_id = sheet_id_match.group(1) if sheet_id_match else None
-    
-    # Match the gid parameter in the URL (after 'gid=')
-    gid_match = re.search(r'gid=([0-9]+)', url)
-    gid = gid_match.group(1) if gid_match else None
-    
-    return sheet_id, gid
-
-def get_param_dict(spreadsheet_url):
-    sheet_id, gid = parse_sheet_url(spreadsheet_url)
-    json_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq?tqx=out:json&gid={gid}"
-    response = requests.get(json_url)
-
-    csv_url = f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
-    csv_content = requests.get(csv_url).content
-    # Decode and load the CSV into a pandas DataFrame
-    df = pd.read_csv(io.StringIO(csv_content.decode('utf-8')))
-
-    # Convert the DataFrame to a dictionary
-    data_dict = {}
-    for _, row in df.iterrows():
-        # Create a composite key using Module, Group, and Field
-        key = f"{row['Module']}-{row['Group']}-{row['Field']}"
-        data_dict[key] = row.to_dict()
-    
-    return data_dict
-    
-def generate_prompt(images, vl_chat_processor, tokenizer, vl_gpt, prompt=None, json_format=False) -> str:
-
-    ## This prompt can be played around with
-    if prompt is None:
-        prompt = "Give me a caption for this background scene. Please describe as many aspects of the scene as you can, with specific descriptions of what is happening in each portion of the image. Please also describe the relative locations of objects and imagery in the scene in relation to each other. "
-    
-    conversation = [
-        {
-            "role": "User",
-            # Note: Prepend the placeholder if your model expects it.
-            "content": f"<image_placeholder> {prompt}",
-            "images": images
-        },
-        {"role": "Assistant", "content": ""},
-    ]
-
-    # Load the image(s) for this conversation.
-    if isinstance(images[0], Image.Image):
-        pil_images = images
+def generate_prompt(prompt, vl_chat_processor, tokenizer, vl_gpt, image=None, json_format = False) -> str:
+    # Build the conversation differently based on whether an image is provided.
+    if image is None:
+        conversation = [
+            {"role": "User", "content": prompt, "images": []},
+            {"role": "Assistant", "content": ""}
+        ]
     else:
-        pil_images = load_pil_images(conversation)
-
-    # torch.cuda.set_device(vl_gpt.device)
-
+        conversation = [
+            {"role": "User", "content": f"<image_placeholder> {prompt}", "images": [image]},
+            {"role": "Assistant", "content": ""}
+        ]
+    
+    # Load the image(s) for this conversation (if any).
+    pil_images = load_pil_images(conversation)
+    
+    torch.cuda.set_device("cuda:3")
+    
     # Prepare inputs using the VLChat processor.
     prepare_inputs = vl_chat_processor(
         conversations=conversation, images=pil_images, force_batchify=True
-    ).to(vl_gpt.device)
-
-    # If prepare_inputs does not have a .to() method for all tensors,
-    # iterate over its attributes and move any tensor to GPU.
+    ).to("cuda")
+    
+    # Move any tensor attributes to GPU.
     for key, value in vars(prepare_inputs).items():
         if isinstance(value, torch.Tensor):
             setattr(prepare_inputs, key, value.cuda())
-
+    
     # Run the image encoder to get image embeddings.
     inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
-
+    
     # Generate a response.
     outputs = vl_gpt.language_model.generate(
         inputs_embeds=inputs_embeds,
@@ -142,11 +94,11 @@ def generate_prompt(images, vl_chat_processor, tokenizer, vl_gpt, prompt=None, j
         do_sample=False,
         use_cache=True,
     )
-
+    
     # Decode the output.
     answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
     sft_format = getattr(prepare_inputs, "sft_format", [""])[0]  # Adjust if needed.
-
+    
     # Save the result.
     # result = {
     #     "prompt": prompt,
@@ -164,42 +116,42 @@ def generate_prompt(images, vl_chat_processor, tokenizer, vl_gpt, prompt=None, j
     
     return answer
 
-def generate_coordinates(background_image, 
-                         muse_image, 
-                         bg_width, 
-                         bg_height, 
-                         person_width, 
-                         person_height,
-                         vl_chat_processor, tokenizer, vl_gpt) -> dict:
-    """
-    Given the background and person images along with their dimensions,
-    returns a dictionary with the recommended placement parameters:
-      - top_offset (in pixels)
-      - left_offset (in pixels)
-      - scale_factor (a float; e.g., 0.5 means scale the person image to 50% of its original height)
+# def generate_coordinates(background_image, 
+#                          muse_image, 
+#                          bg_width, 
+#                          bg_height, 
+#                          person_width, 
+#                          person_height,
+#                          vl_chat_processor, tokenizer, vl_gpt) -> dict:
+#     """
+#     Given the background and person images along with their dimensions,
+#     returns a dictionary with the recommended placement parameters:
+#       - top_offset (in pixels)
+#       - left_offset (in pixels)
+#       - scale_factor (a float; e.g., 0.5 means scale the person image to 50% of its original height)
     
-    This function uses a VL model (via Deepseek) to determine where to place the person image.
-    """
-    # Define a prompt that instructs the model to output placement parameters in JSON.
-    prompt = (
-        "Given the following image dimensions:\n"
-        f"Background: width={bg_width}, height={bg_height}.\n"
-        f"Person: width={person_width}, height={person_height}.\n"
-        "Based on the scene in the background and the person's pose, "
-        "please determine where the person should be placed on the background. "
-        "Output the recommended placement as a JSON object with the keys "
-        "'top_offset', 'left_offset', and 'scale_factor'. The 'top_offset' and "
-        "'left_offset' should indicate the pixel coordinates for where the top-left corner "
-        "of the person image should be pasted on the background, and 'scale_factor' "
-        "should be a float representing the factor by which to scale the person image."
-    )
+#     This function uses a VL model (via Deepseek) to determine where to place the person image.
+#     """
+#     # Define a prompt that instructs the model to output placement parameters in JSON.
+#     prompt = (
+#         "Given the following image dimensions:\n"
+#         f"Background: width={bg_width}, height={bg_height}.\n"
+#         f"Person: width={person_width}, height={person_height}.\n"
+#         "Based on the scene in the background and the person's pose, "
+#         "please determine where the person should be placed on the background. "
+#         "Output the recommended placement as a JSON object with the keys "
+#         "'top_offset', 'left_offset', and 'scale_factor'. The 'top_offset' and "
+#         "'left_offset' should indicate the pixel coordinates for where the top-left corner "
+#         "of the person image should be pasted on the background, and 'scale_factor' "
+#         "should be a float representing the factor by which to scale the person image."
+#     )
 
-    # Generate placement parameters using Deepseek.
-    answer = generate_prompt([background_image, muse_image], 
-                             vl_chat_processor, tokenizer, vl_gpt, 
-                             prompt=prompt, json_format=True)
+#     # Generate placement parameters using Deepseek.
+#     answer = generate_prompt([background_image, muse_image], 
+#                              vl_chat_processor, tokenizer, vl_gpt, 
+#                              prompt=prompt, json_format=True)
     
-    return answer
+#     return answer
 
 # Load the model and pipeline
 def model_fn(model_dir, hf_token, aws_access_key=None, aws_secret_access_key=None, aws_region='us-west-2', context=None):
@@ -287,16 +239,18 @@ def predict_fn(input_data, model):
     guidance_scale = input_data.get("guidance_scale", 7.5)
     controlnet_condition_scale = input_data.get("controlnet_condition_scale", 0.8)
     generator_seed = input_data.get("generator_seed", 0)
-    spreadsheet_url = input_data.get("params_url", "https://docs.google.com/spreadsheets/d/1EIe9OFpqO1Wc0sYjNSKXhSRBO7k17v9wZE34b3F3TJ4/edit?gid=866270832#gid=866270832")
-    # max_sequence_length = input_data.get("max_sequence_length", 2048)
+    background_prompt = input_data.get("background_prompt", "Analyze the given background sketch and provide a detailed, photorealistic description of the scene. Describe every element as it would appear in real life, including natural lighting, textures, colors, and spatial relationships between objects. Do not reference any sketch-like or hand-drawn qualities; instead, focus solely on creating a description that translates the sketch into a fully realistic rendering. Include details such as the environment's mood, shadow directions, reflective surfaces, and any subtle variations in tone, ensuring that the resulting description can be used as a reference for creating a true-to-life background scene.")
+    negative_prompt = input_data.get("negative_prompt", "lowres, blurry, 2D, sketch, drawing, uniform background")
+    # spreadsheet_url = input_data.get("params_url", "https://docs.google.com/spreadsheets/d/1EIe9OFpqO1Wc0sYjNSKXhSRBO7k17v9wZE34b3F3TJ4/edit?gid=866270832#gid=866270832")
+    # # max_sequence_length = input_data.get("max_sequence_length", 2048)
 
-    params_dict = get_param_dict(spreadsheet_url)
-    logger.info(f"Params dict: {params_dict}")
+    # params_dict = get_param_dict(spreadsheet_url)
+    # logger.info(f"Params dict: {params_dict}")
 
-    # Retrieving relevant prompts from param_dict
-    background_description_prompt = params_dict["ch1-default-background_description_prompt"]
-    vaporwave_prompt = params_dict["ch1-default-80s_prefix"]
-    negative_prompt = params_dict["ch1-default-80s_negative"]
+    # # Retrieving relevant prompts from param_dict
+    # background_description_prompt = params_dict["ch1-default-background_description_prompt"]
+    # vaporwave_prompt = params_dict["ch1-default-80s_prefix"]
+    # negative_prompt = params_dict["ch1-default-80s_negative"]
 
     # Convert base64 to image
     if bg_image_base64 is not None:
@@ -322,17 +276,18 @@ def predict_fn(input_data, model):
     vl_gpt = model["vl_gpt"]
 
     # Generate prompt
-    background_description_prompt = params_dict["ch1-default-background_description_prompt"]
+    #background_description_prompt = params_dict["ch1-default-background_description_prompt"]
     logger.info("Generating background description")
-    image_prompt = generate_prompt([bg_image], vl_chat_processor, tokenizer, vl_gpt, prompt=background_description_prompt)
-    logger.info(f"Prompt generated: {image_prompt}")
+    background_description = generate_prompt(background_prompt, vl_chat_processor, tokenizer, vl_gpt, image = [bg_image])
+    logger.info(f"Background description generated: {background_description}")
 
     # Generate image
     logger.info("Generating image")
     # Stable Diffusion inference
     generator = torch.Generator(device="cpu").manual_seed(generator_seed)
+    prompt = "Using the provided control image (the original background sketch) as a guide, generate a fully realistic rendering of the scene described below. Focus on achieving lifelike lighting, textures, and colors that translate the sketch into a natural, high-resolution image. Follow this detailed description precisely: " + background_description + ". Ensure the final output has no sketch-like qualities, but instead looks like a real-world photograph with accurate shadows, depth, and material details."
     generated_image = sd_pipe(
-        prompt=image_prompt+vaporwave_prompt,
+        prompt = prompt,
         negative_prompt=negative_prompt,
         control_image=bg_image,
         controlnet_conditioning_scale=controlnet_condition_scale,
@@ -341,7 +296,7 @@ def predict_fn(input_data, model):
         generator=generator,
     ).images[0]#.resize((512, 512))
 
-    logger.info("Image generated")
+    logger.info("Background image generated")
 
     # Compositing in Muse
     logger.info("Compositing in Muse")
@@ -384,10 +339,14 @@ def predict_fn(input_data, model):
     logger.info("Determine placement")
     # Determine desired scale relative to the background.
     bg_height, bg_width = bg_tensor.shape[1], bg_tensor.shape[2]
-    scale_factor = 0.5  # For example, set the person height to 50% of background height.
-    new_height = int(bg_height * scale_factor)
+    scale_factor_height = 0.6  # For example, set the person height to 50% of background height.
+    scale_factor_width = 0.5
+    new_height = int(bg_height * scale_factor_height)
     person_height, person_width = person_tensor.shape[1], person_tensor.shape[2]
     new_width = int(person_width * new_height / person_height)  # maintain aspect ratio
+    if new_width > bg_width * scale_factor_width:
+        new_width = int(bg_width * scale_factor_width)
+        new_height = int(person_tensor.shape[1] * new_width / person_tensor.shape[2])
     # Get new tensors and masks
     person_tensor_small = F.interpolate(person_tensor.unsqueeze(0),
                                         size=(new_height, new_width),
