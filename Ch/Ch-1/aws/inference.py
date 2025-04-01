@@ -52,38 +52,43 @@ class SD3CannyImageProcessor(VaeImageProcessor):
         image = super().postprocess(image, **kwargs, do_denormalize=do_denormalize)
         return image
     
-def generate_prompt(prompt, vl_chat_processor, tokenizer, vl_gpt, image=None, json_format = False) -> str:
-    # Build the conversation differently based on whether an image is provided.
-    if image is None:
-        conversation = [
-            {"role": "User", "content": prompt, "images": []},
-            {"role": "Assistant", "content": ""}
-        ]
+def generate_prompt(prompt, vl_chat_processor, tokenizer, vl_gpt, image=None, json_format=False) -> str:
+    # Set a default prompt if none is provided.
+    if prompt is None:
+        prompt = ("Analyze the given background sketch and provide a detailed, photorealistic description of the scene. Describe every element as it would appear in real life, including natural lighting, textures, colors, and spatial relationships between objects. Do not reference any sketch-like or hand-drawn qualities; instead, focus solely on creating a description that translates the sketch into a fully realistic rendering. Include details such as the environment's mood, shadow directions, reflective surfaces, and any subtle variations in tone, ensuring that the resulting description can be used as a reference for creating a true-to-life background scene. ")
+    
+    # Build the conversation using the provided prompt and image.
+    conversation = [
+        {
+            "role": "User",
+            "content": f"<image_placeholder> {prompt}",
+            "images": [image] if image is not None else []
+        },
+        {"role": "Assistant", "content": ""},
+    ]
+    
+    # Load the image(s) for this conversation.
+    if image is not None and isinstance(image, Image.Image):
+        pil_images = [image]
     else:
-        conversation = [
-            {"role": "User", "content": f"<image_placeholder> {prompt}", "images": [image]},
-            {"role": "Assistant", "content": ""}
-        ]
-    
-    # Load the image(s) for this conversation (if any).
-    pil_images = load_pil_images(conversation)
-    
-    torch.cuda.set_device("cuda:3")
+        pil_images = load_pil_images(conversation)
     
     # Prepare inputs using the VLChat processor.
     prepare_inputs = vl_chat_processor(
         conversations=conversation, images=pil_images, force_batchify=True
-    ).to("cuda")
+    ).to(vl_gpt.device)
     
-    # Move any tensor attributes to GPU.
-    for key, value in vars(prepare_inputs).items():
-        if isinstance(value, torch.Tensor):
-            setattr(prepare_inputs, key, value.cuda())
+    # # Ensure all tensor attributes are moved to the GPU.
+    # for key, value in vars(prepare_inputs).items():
+    #     if isinstance(value, torch.Tensor):
+    #         setattr(prepare_inputs, key, value.cuda())
+
+    # setattr(prepare_inputs, key, value.cuda(vl_gpt.device))
     
     # Run the image encoder to get image embeddings.
     inputs_embeds = vl_gpt.prepare_inputs_embeds(**prepare_inputs)
     
-    # Generate a response.
+    # Generate a response using the language model.
     outputs = vl_gpt.language_model.generate(
         inputs_embeds=inputs_embeds,
         attention_mask=prepare_inputs.attention_mask,
@@ -95,19 +100,11 @@ def generate_prompt(prompt, vl_chat_processor, tokenizer, vl_gpt, image=None, js
         use_cache=True,
     )
     
-    # Decode the output.
+    # Decode the generated output.
     answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
-    sft_format = getattr(prepare_inputs, "sft_format", [""])[0]  # Adjust if needed.
+    sft_format = getattr(prepare_inputs, "sft_format", [""])[0]  # (Adjust if needed)
     
-    # Save the result.
-    # result = {
-    #     "prompt": prompt,
-    #     "image": image,
-    #     "response": answer,
-    # }
-
     result = answer
-
     if json_format:
         try:
             result = json.loads(answer)
@@ -115,6 +112,7 @@ def generate_prompt(prompt, vl_chat_processor, tokenizer, vl_gpt, image=None, js
             raise ValueError(f"Failed to parse answer as JSON. Answer: {answer}\nError: {e}")
     
     return answer
+
 
 # def generate_coordinates(background_image, 
 #                          muse_image, 
@@ -175,8 +173,8 @@ def model_fn(model_dir, hf_token, aws_access_key=None, aws_secret_access_key=Non
                                                             device_map="balanced",
                                                             max_memory={0: "24GB", 1: "24GB", 2: "24GB", 3: "24GB"},
                                                         )
-    controlnet.to('cuda:3')
-    sd_pipe.controlnet = controlnet
+    #controlnet.to('cuda:3')
+    sd_pipe.controlnet.to('cuda:3')
     sd_pipe.image_processor = SD3CannyImageProcessor()
     logger.info("Stable Diffusion Model loaded!")
 
@@ -205,11 +203,26 @@ def model_fn(model_dir, hf_token, aws_access_key=None, aws_secret_access_key=Non
     #                                aws_secret_access_key=aws_secret_access_key,
     #                                region_name=aws_region)
 
-    return {"sd_pipe": sd_pipe, 
+    seg_model = tvmodels.segmentation.deeplabv3_resnet101(pretrained=True)
+    seg_model.to('cuda:3').eval()
+    logger.info("Segmentation model loaded!")
+
+    seg_transform = tvtransforms.Compose( [
+                                            tvtransforms.Resize(520),
+                                            tvtransforms.ToTensor(),
+                                            tvtransforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                                        std=[0.229, 0.224, 0.225])
+                                            ] )
+
+    return {
+            "sd_pipe": sd_pipe, 
             # "bedrock_runtime": bedrock_runtime,
             "vl_chat_processor": vl_chat_processor,
             "tokenizer": tokenizer,
-            "vl_gpt": vl_gpt}
+            "vl_gpt": vl_gpt,
+            "seg_model": seg_model,
+            "seg_transform": seg_transform
+            }
 
 # Process incoming input
 def input_fn(serialized_input_data, content_type):
@@ -278,7 +291,7 @@ def predict_fn(input_data, model):
     # Generate prompt
     #background_description_prompt = params_dict["ch1-default-background_description_prompt"]
     logger.info("Generating background description")
-    background_description = generate_prompt(background_prompt, vl_chat_processor, tokenizer, vl_gpt, image = [bg_image])
+    background_description = generate_prompt(background_prompt, vl_chat_processor, tokenizer, vl_gpt, image = bg_image)
     logger.info(f"Background description generated: {background_description}")
 
     # Generate image
@@ -305,21 +318,26 @@ def predict_fn(input_data, model):
     bg_tensor = to_tensor(generated_image)
     person_tensor = to_tensor(muse_image)
 
-    logger.info("Loading segmentation model")
-    seg_model = tvmodels.segmentation.deeplabv3_resnet101(pretrained = True)
-    seg_model.eval()
+    # logger.info("Loading segmentation model")
+    # seg_model = tvmodels.segmentation.deeplabv3_resnet101(pretrained = True)
+    # seg_model.eval()
 
-    seg_transform = tvtransforms.Compose( [
-                                            tvtransforms.Resize(520),
-                                            tvtransforms.ToTensor(),
-                                            tvtransforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                        std=[0.229, 0.224, 0.225])
-                                            ] )
+    # seg_transform = tvtransforms.Compose( [
+    #                                         tvtransforms.Resize(520),
+    #                                         tvtransforms.ToTensor(),
+    #                                         tvtransforms.Normalize(mean=[0.485, 0.456, 0.406],
+    #                                                     std=[0.229, 0.224, 0.225])
+    #                                         ] )
 
-    person_for_seg = seg_transform(muse_image).unsqueeze(0)
+    # get segmentation model
+    seg_model = model["seg_model"]
+    seg_transform = model["seg_transform"]
+
+    seg_model_device = next(seg_model.parameters()).device
+    person_for_seg = seg_transform(muse_image).unsqueeze(0).to(seg_model_device)
     logger.info("Segmenting person")
     with torch.no_grad():
-        output = seg_model(person_for_seg)['out'][0]
+        output = seg_model(person_for_seg)['out'][0].cpu()
 
     logger.info("Generating mask")
     person_class = 15 # typically the case for COCO
@@ -339,14 +357,10 @@ def predict_fn(input_data, model):
     logger.info("Determine placement")
     # Determine desired scale relative to the background.
     bg_height, bg_width = bg_tensor.shape[1], bg_tensor.shape[2]
-    scale_factor_height = 0.6  # For example, set the person height to 50% of background height.
-    scale_factor_width = 0.5
-    new_height = int(bg_height * scale_factor_height)
+    scale_factor = 0.5  # For example, set the person height to 50% of background height.
+    new_height = int(bg_height * scale_factor)
     person_height, person_width = person_tensor.shape[1], person_tensor.shape[2]
     new_width = int(person_width * new_height / person_height)  # maintain aspect ratio
-    if new_width > bg_width * scale_factor_width:
-        new_width = int(bg_width * scale_factor_width)
-        new_height = int(person_tensor.shape[1] * new_width / person_tensor.shape[2])
     # Get new tensors and masks
     person_tensor_small = F.interpolate(person_tensor.unsqueeze(0),
                                         size=(new_height, new_width),
