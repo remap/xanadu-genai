@@ -27,12 +27,17 @@ import torchvision.models as tvmodels
 
 import json
 import io, base64
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance, ImageFilter
 from huggingface_hub import login
 import boto3
 import gzip
+import random
+import cv2
 
 import gc 
+#from RealESRGAN import RealESRGAN
+from rembg import remove
+import numpy as np
 
 def flush():
     gc.collect()
@@ -95,61 +100,19 @@ def generate_prompt(prompt, vl_chat_processor, tokenizer, vl_gpt, image=None, js
         pad_token_id=tokenizer.eos_token_id,
         bos_token_id=tokenizer.bos_token_id,
         eos_token_id=tokenizer.eos_token_id,
-        max_new_tokens=512,
+        max_new_tokens=256,
         do_sample=False,
         use_cache=True,
     )
     
     # Decode the generated output.
     answer = tokenizer.decode(outputs[0].cpu().tolist(), skip_special_tokens=True)
-    sft_format = getattr(prepare_inputs, "sft_format", [""])[0]  # (Adjust if needed)
-    
-    result = answer
-    if json_format:
-        try:
-            result = json.loads(answer)
-        except Exception as e:
-            raise ValueError(f"Failed to parse answer as JSON. Answer: {answer}\nError: {e}")
-    
+    max_text_length = 980
+    if len(answer) > max_text_length:
+        answer = answer[:max_text_length].rstrip()
+
     return answer
 
-
-# def generate_coordinates(background_image, 
-#                          muse_image, 
-#                          bg_width, 
-#                          bg_height, 
-#                          person_width, 
-#                          person_height,
-#                          vl_chat_processor, tokenizer, vl_gpt) -> dict:
-#     """
-#     Given the background and person images along with their dimensions,
-#     returns a dictionary with the recommended placement parameters:
-#       - top_offset (in pixels)
-#       - left_offset (in pixels)
-#       - scale_factor (a float; e.g., 0.5 means scale the person image to 50% of its original height)
-    
-#     This function uses a VL model (via Deepseek) to determine where to place the person image.
-#     """
-#     # Define a prompt that instructs the model to output placement parameters in JSON.
-#     prompt = (
-#         "Given the following image dimensions:\n"
-#         f"Background: width={bg_width}, height={bg_height}.\n"
-#         f"Person: width={person_width}, height={person_height}.\n"
-#         "Based on the scene in the background and the person's pose, "
-#         "please determine where the person should be placed on the background. "
-#         "Output the recommended placement as a JSON object with the keys "
-#         "'top_offset', 'left_offset', and 'scale_factor'. The 'top_offset' and "
-#         "'left_offset' should indicate the pixel coordinates for where the top-left corner "
-#         "of the person image should be pasted on the background, and 'scale_factor' "
-#         "should be a float representing the factor by which to scale the person image."
-#     )
-
-#     # Generate placement parameters using Deepseek.
-#     answer = generate_prompt([background_image, muse_image], 
-#                              vl_chat_processor, tokenizer, vl_gpt, 
-#                              prompt=prompt, json_format=True)
-    
-#     return answer
 
 # Load the model and pipeline
 def model_fn(model_dir, hf_token, aws_access_key=None, aws_secret_access_key=None, aws_region='us-west-2', context=None):
@@ -176,6 +139,12 @@ def model_fn(model_dir, hf_token, aws_access_key=None, aws_secret_access_key=Non
     #controlnet.to('cuda:3')
     sd_pipe.controlnet.to('cuda:3')
     sd_pipe.image_processor = SD3CannyImageProcessor()
+    sd_pipe.load_ip_adapter(
+        "InstantX/SD3.5-Large-IP-Adapter",  
+        subfolder="",                       
+        weight_name="ip-adapter.bin", 
+        image_encoder_folder="google/siglip-so400m-patch14-384"# exact filename
+    )
     logger.info("Stable Diffusion Model loaded!")
 
     # Load DeepSeek
@@ -196,32 +165,38 @@ def model_fn(model_dir, hf_token, aws_access_key=None, aws_secret_access_key=Non
     logger.info(f"vl gpt device: {vl_gpt.device}; vl gpt dtype: {vl_gpt.dtype}")
     logger.info("DeepSeek Model loaded!")
 
-    # Load Bedrock
-    # logger.info("Loading Bedrock runtime...")
-    # bedrock_runtime = boto3.client('bedrock-runtime',
-    #                                aws_access_key_id=aws_access_key,
-    #                                aws_secret_access_key=aws_secret_access_key,
-    #                                region_name=aws_region)
+    #Load Bedrock
+    logger.info("Loading Bedrock runtime...")
+    bedrock_runtime = boto3.client('bedrock-runtime',
+                                   aws_access_key_id=aws_access_key,
+                                   aws_secret_access_key=aws_secret_access_key,
+                                   region_name='us-east-1')
 
-    seg_model = tvmodels.segmentation.deeplabv3_resnet101(pretrained=True)
-    seg_model.to('cuda:3').eval()
-    logger.info("Segmentation model loaded!")
+    # seg_model = tvmodels.segmentation.deeplabv3_resnet101(pretrained=True)
+    # seg_model.to('cuda:3').eval()
+    # logger.info("Segmentation model loaded!")
 
-    seg_transform = tvtransforms.Compose( [
-                                            tvtransforms.Resize(520),
-                                            tvtransforms.ToTensor(),
-                                            tvtransforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                                        std=[0.229, 0.224, 0.225])
-                                            ] )
+    # seg_transform = tvtransforms.Compose( [
+    #                                         tvtransforms.Resize(520),
+    #                                         tvtransforms.ToTensor(),
+    #                                         tvtransforms.Normalize(mean=[0.485, 0.456, 0.406],
+    #                                                     std=[0.229, 0.224, 0.225])
+    #                                         ] )
+    # ESRGAN model
+    # model_dir = '/opt/ml/Real-ESRGAN/weights'
+    # model_name = 'RealESRGAN_x4.pth'
+    # gan_model = RealESRGAN('cuda:1', scale=4)
+    # gan_model.load_weights(os.path.join(model_dir, model_name), download=False)
 
     return {
             "sd_pipe": sd_pipe, 
-            # "bedrock_runtime": bedrock_runtime,
+            "bedrock_runtime": bedrock_runtime,
             "vl_chat_processor": vl_chat_processor,
             "tokenizer": tokenizer,
             "vl_gpt": vl_gpt,
-            "seg_model": seg_model,
-            "seg_transform": seg_transform
+            # "seg_model": seg_model,
+            # "seg_transform": seg_transform,
+            # "gan_model": gan_model
             }
 
 # Process incoming input
@@ -244,162 +219,220 @@ def predict_fn(input_data, model):
     # Parse input data
     bg_image_base64 = input_data["bg_image"]
     muse_image_base64 = input_data["muse_image"]
+    ref_image_base64 = input_data["ref_image"]
     #image_prompt = input_data.get("image_prompt", None)
-    #extra_image_prompt = input_data.get("extra_image_prompt", " in a realistic 1980s retro vaporwave style")
+    muse_prompt = input_data.get("muse_prompt", "")
     #background_generationprompt = input_data.get("llm_prompt", None)
-    negative_prompt = input_data.get("negative_prompt", "")
     steps = input_data.get("steps", 50)
     guidance_scale = input_data.get("guidance_scale", 5)
     controlnet_condition_scale = input_data.get("controlnet_condition_scale", 0.4)
     generator_seed = input_data.get("generator_seed", 0)
-    background_prompt = input_data.get("background_prompt", "Analyze the given background sketch and provide a detailed, photorealistic description of the scene. Describe every element as it would appear in real life, including natural lighting, textures, colors, and spatial relationships between objects. Do not reference any sketch-like or hand-drawn qualities; instead, focus solely on creating a description that translates the sketch into a fully realistic rendering. Include details such as the environment's mood, shadow directions, reflective surfaces, and any subtle variations in tone, ensuring that the resulting description can be used as a reference for creating a true-to-life background scene.")
+    ip_adapter_scale = input_data.get("ip_adapter_scale", 0.6)
+    llm_prompt = input_data.get("llm_prompt", "Analyze the given background sketch and provide a detailed, photorealistic description of the scene. Describe every element as it would appear in real life, including natural lighting, textures, colors, and spatial relationships between objects. Do not reference any sketch-like or hand-drawn qualities; instead, focus solely on creating a description that translates the sketch into a fully realistic rendering. Include details such as the environment's mood, shadow directions, reflective surfaces, and any subtle variations in tone, ensuring that the resulting description can be used as a reference for creating a true-to-life background scene.")
     negative_prompt = input_data.get("negative_prompt", "lowres, blurry, 2D, sketch, drawing, uniform background")
-    # spreadsheet_url = input_data.get("params_url", "https://docs.google.com/spreadsheets/d/1EIe9OFpqO1Wc0sYjNSKXhSRBO7k17v9wZE34b3F3TJ4/edit?gid=866270832#gid=866270832")
-    # # max_sequence_length = input_data.get("max_sequence_length", 2048)
-
-    # params_dict = get_param_dict(spreadsheet_url)
-    # logger.info(f"Params dict: {params_dict}")
-
-    # # Retrieving relevant prompts from param_dict
-    # background_description_prompt = params_dict["ch1-default-background_description_prompt"]
-    # vaporwave_prompt = params_dict["ch1-default-80s_prefix"]
-    # negative_prompt = params_dict["ch1-default-80s_negative"]
-
+    background_description = input_data.get("background_description", None)
     # Convert base64 to image
     if bg_image_base64 is not None:
         # Decode image from Base64
         bg_image_data = base64.b64decode(bg_image_base64)
         bg_image = Image.open(io.BytesIO(bg_image_data)).convert("RGB")#.resize((512,512))
+        logger.info(f" Background image mode: {bg_image.mode}")
     else:
         raise ValueError("Input must include a background image.")
     
     if muse_image_base64 is not None:
         # Decode image from Base64
         muse_image_data = base64.b64decode(muse_image_base64)
-        muse_image = Image.open(io.BytesIO(muse_image_data)).convert("RGB")#.resize((512,512))
+        muse_image = Image.open(io.BytesIO(muse_image_data)).convert("RGBA")#.resize((512,512)) #RGBA so image is transparent
+        logger.info(f" Muse image mode: {muse_image.mode}")
     else:
         raise ValueError("Input must include a muse image.")
+    
+    if ref_image_base64 is not None:
+        # Decode image from Base64
+        ref_image_data = base64.b64decode(ref_image_base64)
+        ref_image = Image.open(io.BytesIO(ref_image_data)).convert("RGB")#.resize((512,512))
+    else:
+        raise ValueError("Input must include a reference image.")
 
 
     #  Parse model
     sd_pipe = model["sd_pipe"]
-    # bedrock_runtime = model["bedrock_runtime"]
+    bedrock_runtime = model["bedrock_runtime"]
     vl_chat_processor = model["vl_chat_processor"]
     tokenizer = model["tokenizer"]
     vl_gpt = model["vl_gpt"]
 
     # Generate prompt
-    #background_description_prompt = params_dict["ch1-default-background_description_prompt"]
     logger.info("Generating background description")
-    background_description = generate_prompt(background_prompt, vl_chat_processor, tokenizer, vl_gpt, image = bg_image)
+    if background_description == "nan":
+        logger.info("Background description not provided, generating using LLM")
+        background_description = generate_prompt(llm_prompt, vl_chat_processor, tokenizer, vl_gpt, image = bg_image)
     logger.info(f"Background description generated: {background_description}")
 
+    # model prompt
+    model_prompt = "Using the provided control image (the original background sketch) as a guide, generate a fully realistic rendering of the scene described below. Focus on achieving lifelike lighting, textures, and colors that translate the sketch into a natural, high-resolution image. Follow this detailed description precisely: " + background_description + ". Ensure the final output has no sketch-like qualities, but instead looks like a real-world photograph with accurate shadows, depth, and material details."
+    logger.info(f"Model prompt: {model_prompt}")
     # Generate image
     logger.info("Generating image")
     # Stable Diffusion inference
     generator = torch.Generator(device="cpu").manual_seed(generator_seed)
-    prompt = "Using the provided control image (the original background sketch) as a guide, generate a fully realistic rendering of the scene described below. Focus on achieving lifelike lighting, textures, and colors that translate the sketch into a natural, high-resolution image. Follow this detailed description precisely: " + background_description + ". Ensure the final output has no sketch-like qualities, but instead looks like a real-world photograph with accurate shadows, depth, and material details."
-    generated_image = sd_pipe(
+    #prompt = "Using the provided control image (the original background sketch) as a guide, generate a fully realistic rendering of the scene described below. Focus on achieving lifelike lighting, textures, and colors that translate the sketch into a natural, high-resolution image. Follow this detailed description precisely: " + background_description + ". Ensure the final output has no sketch-like qualities, but instead looks like a real-world photograph with accurate shadows, depth, and material details."
+    sd_pipe.set_ip_adapter_scale(ip_adapter_scale)
+    prompt = model_prompt
+    if muse_prompt != "nan":
+        # Add the muse prompt to the model prompt
+        logger.info(f"Muse prompt: {muse_prompt}")
+        prompt = model_prompt + muse_prompt
+    original_image = sd_pipe(
         prompt = prompt,
         negative_prompt=negative_prompt,
         control_image=bg_image,
+        ip_adapter_image = ref_image,
         controlnet_conditioning_scale=controlnet_condition_scale,
         num_inference_steps=steps,
         guidance_scale=guidance_scale,
+        width = 512,
+        height = 384,
         generator=generator,
-    ).images[0]#.resize((512, 512))
+    ).images[0]
 
     logger.info("Background image generated")
 
+
+    # call Amazon Nova Canvas for resizing + super resolution
+    logger.info("Calling Nova Canvas…")
+    buf = io.BytesIO()
+    original_image.save(buf, format="PNG")
+    img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    # 2. Build the IMAGE_VARIATION payload
+    variation_body = json.dumps({
+        "taskType": "IMAGE_VARIATION",
+        "imageVariationParams": {
+            "text": background_description + "photorealistic,cinematic,8k,hdr",
+            "negativeText": "bad quality, low resolution, cartoon",
+            "images": [ img_b64 ],          
+            "similarityStrength": 0.7       
+        },
+        "imageGenerationConfig": {
+            "numberOfImages": 1,
+            "height": 512,
+            "width": 2048,
+            "cfgScale": 6.5     
+        }
+    })
+
+    # 3. Invoke Nova Canvas IMAGE_VARIATION
+    response = bedrock_runtime.invoke_model(
+        modelId="amazon.nova-canvas-v1:0",
+        body=variation_body,
+        contentType="application/json",
+        accept="application/json"
+    )
+    logger.info("Nova image generated")
+
+    # 4. Decode the returned image
+    resp_json   = json.loads(response["body"].read())
+    out_b64     = resp_json["images"][0]
+    out_bytes   = base64.b64decode(out_b64)
+    generated_image = Image.open(io.BytesIO(out_bytes)).convert("RGBA")
+    logger.info("decoding of Nova image generated")
+
+    def resize_image(image, target_size=(1024, 256)):
+            
+        if image.size != target_size:
+            image_np = cv2.resize(np.array(image), target_size, interpolation=cv2.INTER_AREA)
+            #image_np = cv2.edgePreservingFilter(image_np, flags=1, sigma_s=20, sigma_r=0.07)
+            image = Image.fromarray(image_np)
+            
+        return image
+    
+    # Resize the image
+    # generated_image = resize_image(generated_image, target_size=(1024, 192))
+    generated_image = generated_image.resize((1024, 192), resample=Image.LANCZOS)
+    logger.info("Background image resized")
+
     # Compositing in Muse
     logger.info("Compositing in Muse")
-    to_tensor = tvtransforms.ToTensor()
-    to_pil = tvtransforms.ToPILImage() 
-    bg_tensor = to_tensor(generated_image)
-    person_tensor = to_tensor(muse_image)
+    # logger.info(" Converting muse image from RGB to RGBA")
+    # # Convert the muse image to RGBA
+    # muse_np = np.array(muse_image)
+    # muse_transparent_np = remove(muse_np)   # returns an RGBA numpy array
+    muse_rgba = muse_image #Image.fromarray(muse_transparent_np)    
+    logger.info(f" Muse image mode after conversion: {muse_rgba.mode}")
+    # Convert the background image to RGBA
+    # logger.info(" Converting generated image from RGB to RGBA")
+    bg_rgba = generated_image#.convert("RGBA")  
+    logger.info(f" Background image mode after conversion: {bg_rgba.mode}")
 
-    # logger.info("Loading segmentation model")
-    # seg_model = tvmodels.segmentation.deeplabv3_resnet101(pretrained = True)
-    # seg_model.eval()
+    # muse_rgba = muse_image
+    # logger.info(f" Muse image mode after conversion: {muse_rgba.mode}")
+    # logger.info(f" Background image mode after conversion: {bg_rgba.mode}")
+    # Convert the muse image to a tensor
+    # logger.info(" Converting generated image to tensor")
+    # to_tensor = tvtransforms.ToTensor()
+    # to_pil = tvtransforms.ToPILImage() 
+    # bg_tensor = to_tensor(generated_image)
+    # person_tensor = to_tensor(muse_rgba)
+    # bg_rgba = generated_image
+    # muse_rgba = muse_image
 
-    # seg_transform = tvtransforms.Compose( [
-    #                                         tvtransforms.Resize(520),
-    #                                         tvtransforms.ToTensor(),
-    #                                         tvtransforms.Normalize(mean=[0.485, 0.456, 0.406],
-    #                                                     std=[0.229, 0.224, 0.225])
-    #                                         ] )
+    def get_random_bottom_offset(bg_size, fg_size, margin=150):
+        bg_w, bg_h = bg_size
+        fg_w, fg_h = fg_size
+        top      = bg_h - fg_h
+        max_left = bg_w - fg_w - margin
+        left     = (bg_w - fg_w)//2 if max_left < margin else random.randint(margin, max_left)
+        return left, top
 
-    # get segmentation model
-    seg_model = model["seg_model"]
-    seg_transform = model["seg_transform"]
-
-    seg_model_device = next(seg_model.parameters()).device
-    person_for_seg = seg_transform(muse_image).unsqueeze(0).to(seg_model_device)
-    logger.info("Segmenting person")
-    with torch.no_grad():
-        output = seg_model(person_for_seg)['out'][0].cpu()
-
-    logger.info("Generating mask")
-    person_class = 15 # typically the case for COCO
-    mask_pred = output.argmax(0) == person_class # boolean mask
-    mask = mask_pred.to(torch.float32)
-    mask = F.interpolate(mask.unsqueeze(0).unsqueeze(0), 
-                         size = person_tensor.shape[1:], 
-                         mode = 'bilinear', 
-                         align_corners = False).squeeze()
-    # Composite
-    # Expand mask to have same number of channels as person image
-    if mask.ndim == 2:
-        mask = mask.unsqueeze(0)
-    if mask.shape[0] == 1 and person_tensor.shape[0] == 3:
-        mask = mask.expand(3, -1, -1)
-
-    logger.info("Determine placement")
-    # Determine desired scale relative to the background.
-    bg_height, bg_width = bg_tensor.shape[1], bg_tensor.shape[2]
-    scale_factor = 0.5  # For example, set the person height to 50% of background height.
-    new_height = int(bg_height * scale_factor)
-    person_height, person_width = person_tensor.shape[1], person_tensor.shape[2]
-    new_width = int(person_width * new_height / person_height)  # maintain aspect ratio
-    # Get new tensors and masks
-    person_tensor_small = F.interpolate(person_tensor.unsqueeze(0),
-                                        size=(new_height, new_width),
-                                        mode='bilinear',
-                                        align_corners=False).squeeze(0)
-    mask_small = F.interpolate(mask.unsqueeze(0),
-                            size=(new_height, new_width),
-                            mode='bilinear',
-                            align_corners=False).squeeze(0)
-    mask_small = torch.clamp(mask_small, 0, 1)
-    bg_h, bg_w = bg_tensor.shape[1], bg_tensor.shape[2]
-    person_h, person_w = person_tensor.shape[1], person_tensor.shape[2]
-
-    def get_placement_offsets_bottom_center(background, person):
+    def composite_muse_image(
+        background: Image.Image,
+        muse: Image.Image,
+        max_h_pct: float = 0.8,
+        max_w_pct: float = 0.5,
+    ) -> Image.Image:
         """
-        Compute offsets to place the person at the bottom center of the background.
-        :param background: Tensor of shape [C, H, W] for the background.
-        :param person: Tensor of shape [C, h, w] for the scaled person.
-        :return: (top_offset, left_offset) in pixel coordinates.
+        Composite a muse image onto a background image.
         """
-        bg_h, bg_w = background.shape[1], background.shape[2]
-        person_h, person_w = person.shape[1], person.shape[2]
-        top_offset = bg_h - person_h  # Align bottom edges.
-        left_offset = (bg_w - person_w) // 2  # Center horizontally.
-        return top_offset, left_offset
-    
-    logger.info("Get placement offsets")
-    top_offset, left_offset = get_placement_offsets_bottom_center(bg_tensor, person_tensor_small)
-    if top_offset < 0 or left_offset < 0 or (top_offset + new_height > bg_height) or (left_offset + new_width > bg_width):
-        raise ValueError("The computed offsets cause the person image to fall outside the background.")
-    logger.info(f"Placement offsets: top={top_offset}, left={left_offset}")
+        bg = background
+        mu = muse
+        logger.info("Beginning to composite muse image")
+        # scale muse
+        bg_w, bg_h = bg.size
+        m_w, m_h   = mu.size
+        scale      = min((bg_h * max_h_pct)/m_h, (bg_w * max_w_pct)/m_w)
+        nw, nh     = int(m_w * scale), int(m_h * scale)
+        mu_small   = mu.resize((nw, nh), Image.LANCZOS)
 
-    logger.info("Compositing")
-    composite = bg_tensor.clone()
-    bg_roi = composite[:, top_offset:top_offset+new_height, left_offset:left_offset+new_width] # getting new position
-    blended_roi = person_tensor_small * mask_small + bg_roi * (1 - mask_small) # getting composite 
-    composite[:, top_offset:top_offset+new_height, left_offset:left_offset+new_width] = blended_roi
-    composite_img = to_pil(composite)
-    logger.info("Image compositing done")
+        # pick random bottom‐aligned spot
+        left, top = get_random_bottom_offset((bg_w, bg_h), (nw, nh))
+
+        # # get silhouette mask, dilate & blur
+        # silh = mu_small.split()[3]                                     # pure alpha
+        # silh = silh.filter(ImageFilter.MaxFilter(dilate_px*2+1))       # dilate
+        # silh = silh.filter(ImageFilter.GaussianBlur(blur_radius))     # soft edge
+
+        # # crop & brighten exactly under that shape
+        # region = (left, top, left+nw, top+nh)
+        # patch  = bg.crop(region)
+        # bright = ImageEnhance.Brightness(patch).enhance(brighten_factor)
+        # # paste brightened patch *using the silh mask* instead of a rectangle
+        # bg.paste(bright, (left, top), silh)
+
+        # paste the muse itself on top (using its alpha)
+        bg.paste(mu_small, (left, top), mu_small)
+        #bg.alpha_composite(mu_small, (left, top))
+        logger.info("Finished compositing muse image")
+        return bg#.convert("RGB")
+
+    composite_img = composite_muse_image(
+        bg_rgba,
+        muse_rgba,
+        max_h_pct=0.8,
+        max_w_pct=0.5,
+    )
+    logger.info("Muse image composited")
 
     return composite_img
 
